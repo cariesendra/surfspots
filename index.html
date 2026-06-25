@@ -252,10 +252,6 @@
             });
 
             if (markers.length > 0) {
-                const group = L.featureGroup(markers.map(m => m.marker));
-                if (!location.hash.match(/^#\/map\//)) {
-                    lmap.fitBounds(group.getBounds(), { padding: [50, 50] });
-                }
                 status.textContent = markers.length + ' surf spots loaded';
             } else {
                 status.textContent = 'No spots could be placed — check console';
