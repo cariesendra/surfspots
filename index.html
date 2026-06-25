@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>SL Surf Map</title>
+    <script src="https://maps.secondlife.com/_scripts/sl.mapapi2.js"></script>
+    <link rel="stylesheet" type="text/css" href="https://maps.secondlife.com/_styles/sl.mapapi2.css">
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+        }
+
+        #map-container {
+            width: 100%;
+            height: 100%;
+        }
+
+        #panel {
+            position: absolute;
+            z-index: 1000;
+            top: 10px;
+            left: 10px;
+            width: 220px;
+            background: rgba(255, 255, 255, 0.45);
+            backdrop-filter: blur(4px);
+            border-radius: 6px;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+            font-family: sans-serif;
+            font-size: 14px;
+            overflow: hidden;
+        }
+
+        #panel-header {
+            padding: 8px 10px;
+            font-weight: bold;
+            color: #333;
+            border-bottom: 1px solid rgba(0,0,0,0.1);
+        }
+
+        #spot-list {
+            list-style: none;
+            margin: 0;
+            padding: 4px 0;
+        }
+
+        #spot-list li {
+            padding: 6px 12px;
+            cursor: pointer;
+            color: #222;
+            transition: background 0.15s;
+        }
+
+        #spot-list li:hover {
+            background: rgba(255, 255, 255, 0.6);
+        }
+
+        #spot-list li.home {
+            color: #555;
+            border-bottom: 1px solid rgba(0,0,0,0.1);
+            margin-bottom: 2px;
+        }
+
+        #status {
+            position: absolute;
+            z-index: 1000;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            color: #fff;
+            font: 13px/1.5 sans-serif;
+            padding: 5px 10px;
+            border-radius: 4px;
+            pointer-events: none;
+        }
+
+        .surf-popup strong {
+            display: block;
+            font-size: 14px;
+            margin-bottom: 4px;
+        }
+
+        .surf-popup .desc {
+            color: #444;
+            font-size: 13px;
+            margin-bottom: 6px;
+        }
+
+        .surf-popup a {
+            color: #0070cc;
+            text-decoration: none;
+            font-size: 13px;
+        }
+
+        .surf-popup a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map-container"></div>
+
+    <div id="panel">
+        <div id="panel-header">Surf Spots</div>
+        <ul id="spot-list"></ul>
+    </div>
+
+    <div id="status">Loading…</div>
+
+    <script>
+        const SHEET_CSV  = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vR7o-djMujy_g8Po0MZkvA628HyQAtmujJQWQLKoPBu-XX3TOCiAtWitiIaKBLZl6iAOvZivFgwYqzw/pub?gid=0&single=true&output=csv';
+        const CAP_URL    = 'https://cap.secondlife.com/cap/0/d661249b-2b5a-4436-966a-3d3b8d7a574f';
+        const SURF_ICON  = L.icon({ iconUrl: 'surf.png', iconSize: [20, 30] });
+        const HOME_VIEW  = { lat: 1029.25, lng: 1088.25, zoom: 1 };
+
+        const status  = document.getElementById('status');
+        const spotList = document.getElementById('spot-list');
+
+        // --- URL hash ---
+
+        function updateHash() {
+            const c    = lmap.getCenter();
+            const zoom = lmap.getZoom();
+            const lat  = Math.round(c.lat * 100) / 100;
+            const lng  = Math.round(c.lng * 100) / 100;
+            history.replaceState(null, '', '#/map/' + zoom + '/' + lat + '/' + lng);
+        }
+
+        function applyHash() {
+            const m = (location.hash || '').match(/^#\/map\/(\d+)\/([\d.]+)\/([\d.]+)$/);
+            if (m) lmap.setView([parseFloat(m[2]), parseFloat(m[3])], parseInt(m[1]));
+            else   lmap.setView([HOME_VIEW.lat, HOME_VIEW.lng], HOME_VIEW.zoom);
+        }
+
+        // --- CSV fetch ---
+
+        async function fetchSheet() {
+            const res  = await fetch(SHEET_CSV);
+            const text = await res.text();
+            const lines = text.trim().split('\n');
+            const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+            return lines.slice(1).map(line => {
+                const values = [];
+                let cur = '', inQ = false;
+                for (const c of line) {
+                    if (c === '"') { inQ = !inQ; }
+                    else if (c === ',' && !inQ) { values.push(cur); cur = ''; }
+                    else { cur += c; }
+                }
+                values.push(cur);
+                const obj = {};
+                headers.forEach((h, i) => { obj[h] = (values[i] || '').replace(/^"|"$/g, '').trim(); });
+                return obj;
+            });
+        }
+
+        // --- SLURL parser ---
+
+        function parseSLURL(url) {
+            const m = url.match(/\/secondlife\/([^/]+)\/(\d+)\/(\d+)\/(\d+)/);
+            if (!m) return null;
+            return { region: decodeURIComponent(m[1]), x: parseInt(m[2]), y: parseInt(m[3]), z: parseInt(m[4]) };
+        }
+
+        // --- Region → grid coords via JSONP + localStorage cache ---
+
+        function resolveRegion(name) {
+            const key    = 'sl_r_' + name.toLowerCase();
+            const cached = localStorage.getItem(key);
+            if (cached) return Promise.resolve(JSON.parse(cached));
+
+            return new Promise((resolve, reject) => {
+                const cb = 'slR_' + Math.random().toString(36).slice(2);
+                const s  = document.createElement('script');
+                s.onload = () => {
+                    const c = window[cb];
+                    delete window[cb];
+                    s.remove();
+                    if (c && typeof c.x === 'number') {
+                        localStorage.setItem(key, JSON.stringify([c.x, c.y]));
+                        resolve([c.x, c.y]);
+                    } else {
+                        reject(new Error('Region not found: ' + name));
+                    }
+                };
+                s.onerror = () => { s.remove(); reject(new Error('JSONP error: ' + name)); };
+                s.src = CAP_URL + '?var=' + cb + '&sim_name=' + encodeURIComponent(name);
+                document.head.appendChild(s);
+            });
+        }
+
+        // --- Main ---
+
+        let lmap;
+
+        async function main() {
+            lmap = new SLMap(document.getElementById('map-container'));
+            applyHash();
+            lmap.on('moveend', updateHash);
+
+            status.textContent = 'Loading sheet…';
+            const rows = (await fetchSheet()).filter(r => r.Location && r.Location.trim());
+
+            const spots = rows.map(r => ({
+                name:        r.Name        || '',
+                description: r.Description || '',
+                slurl:       r.Location,
+                parsed:      parseSLURL(r.Location)
+            })).filter(s => s.parsed);
+
+            status.textContent = spots.length + ' spots found, resolving coordinates…';
+
+            const results = await Promise.allSettled(spots.map(s => resolveRegion(s.parsed.region)));
+
+            const homeItem = document.createElement('li');
+            homeItem.textContent = '⌂ Home';
+            homeItem.className = 'home';
+            homeItem.addEventListener('click', () => lmap.flyTo([HOME_VIEW.lat, HOME_VIEW.lng], HOME_VIEW.zoom, { duration: 1.5 }));
+            spotList.appendChild(homeItem);
+
+            const markers = [];
+            results.forEach((result, i) => {
+                if (result.status !== 'fulfilled') {
+                    console.warn('Could not resolve region:', spots[i].parsed.region, result.reason);
+                    return;
+                }
+                const [gx, gy] = result.value;
+                const { x, y } = spots[i].parsed;
+                const spot     = spots[i];
+                const latlng   = L.latLng(gy + y / 256, gx + x / 256);
+
+                const marker = L.marker(latlng, { icon: SURF_ICON }).addTo(lmap);
+                markers.push({ marker, latlng, spot });
+
+                marker.bindPopup(`
+                    <div class="surf-popup">
+                        <strong>${spot.name}</strong>
+                        <div class="desc">${spot.description}</div>
+                        <a href="${spot.slurl}" target="_blank">Open in SL ↗</a>
+                    </div>
+                `);
+
+                const li = document.createElement('li');
+                li.textContent = spot.name;
+                li.addEventListener('click', () => {
+                    lmap.flyTo(latlng, 6, { duration: 1.5 });
+                    marker.openPopup();
+                });
+                spotList.appendChild(li);
+            });
+
+            if (markers.length > 0) {
+                const group = L.featureGroup(markers.map(m => m.marker));
+                if (!location.hash.match(/^#\/map\//)) {
+                    lmap.fitBounds(group.getBounds(), { padding: [50, 50] });
+                }
+                status.textContent = markers.length + ' surf spots loaded';
+            } else {
+                status.textContent = 'No spots could be placed — check console';
+            }
+        }
+
+        main().catch(e => {
+            console.error(e);
+            status.textContent = 'Error: ' + e.message;
+        });
+    </script>
+</body>
+
+</html>
