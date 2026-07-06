@@ -197,6 +197,8 @@
 
         async function main() {
             lmap = new SLMap(document.getElementById('map-container'));
+            if (lmap.zoomControl) lmap.zoomControl.remove();
+            L.control.zoom({ position: 'bottomright' }).addTo(lmap);
             applyHash();
             lmap.on('moveend', updateHash);
 
